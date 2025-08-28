@@ -171,10 +171,6 @@ def convert_svg_to_png(svg_content):
 # 设置默认生成的设计数量，取代UI上的选择按钮
 DEFAULT_DESIGN_COUNT = 15  # 生成15个设计选项
 
-# 并发优化配置
-MAX_CONCURRENT_WORKERS = 8  # 最大并发工作线程数
-API_TIMEOUT = 30  # API调用超时时间（秒）
-
 def get_ai_design_suggestions(user_preferences=None):
     """Get design suggestions from GPT-4o-mini with more personalized features"""
     client = OpenAI(api_key=get_next_gpt4o_api_key(), base_url=GPT4O_MINI_BASE_URL)
@@ -207,14 +203,13 @@ def get_ai_design_suggestions(user_preferences=None):
     """
     
     try:
-        # 调用GPT-4o-mini，添加超时控制
+        # 调用GPT-4o-mini
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a professional design consultant. Provide design suggestions in JSON format exactly as requested."},
                 {"role": "user", "content": prompt}
-            ],
-            timeout=API_TIMEOUT  # 添加超时
+            ]
         )
         
         # 返回建议内容
@@ -267,13 +262,13 @@ def validate_logo_quality(image):
                 non_transparent_pixels += 1
                 unique_colors.add((r, g, b))
         
-        # 检查是否有足够的非透明像素
-        if non_transparent_pixels < (width * height * 0.05):  # 至少5%的像素应该是非透明的
+        # 检查是否有足够的非透明像素 (降低要求从5%到2%)
+        if non_transparent_pixels < (width * height * 0.02):  # 至少2%的像素应该是非透明的
             return False, "Logo内容过少，可能生成失败"
         
-        # 检查颜色多样性
-        if len(unique_colors) < 2:
-            return False, "Logo颜色过于单一，可能为纯色图像"
+        # 检查颜色多样性 (允许单色但有一定变化的logo)
+        if len(unique_colors) < 1:
+            return False, "Logo没有可见内容"
         
         # 检查是否为纯白色或纯黑色图像
         dominant_colors = {}
@@ -286,15 +281,15 @@ def validate_logo_quality(image):
             most_common_color = max(dominant_colors, key=dominant_colors.get)
             most_common_count = dominant_colors[most_common_color]
             
-            # 如果某种颜色占比超过90%，可能是纯色图像
-            if most_common_count > non_transparent_pixels * 0.9:
+            # 如果某种颜色占比超过95%，且是极端颜色，才认为是问题 (从90%提高到95%)
+            if most_common_count > non_transparent_pixels * 0.95:
                 r, g, b = most_common_color
-                # 检查是否为纯白色或接近白色
-                if r > 240 and g > 240 and b > 240:
-                    return False, "Logo主要为白色，可能生成失败"
-                # 检查是否为纯黑色或接近黑色
-                if r < 15 and g < 15 and b < 15:
-                    return False, "Logo主要为黑色，可能生成失败"
+                # 检查是否为纯白色或接近白色 (放宽白色检测阈值)
+                if r > 250 and g > 250 and b > 250:
+                    return False, "Logo主要为纯白色，可能生成失败"
+                # 检查是否为纯黑色或接近黑色 (放宽黑色检测阈值)
+                if r < 10 and g < 10 and b < 10:
+                    return False, "Logo主要为纯黑色，可能生成失败"
         
         print(f"Logo质量验证通过: 尺寸{width}x{height}, 非透明像素{non_transparent_pixels}, 颜色种类{len(unique_colors)}")
         return True, "Logo质量良好"
@@ -302,55 +297,109 @@ def validate_logo_quality(image):
     except Exception as e:
         return False, f"Logo质量验证出错: {str(e)}"
 
-def generate_vector_image_with_retry(prompt, max_retries=2, background_color=None):
-    """带重试机制的logo生成函数，支持主备API切换 - 优化版本"""
-    # 减少重试次数和等待时间以提高并发性能
-    for attempt in range(max_retries):
-        print(f"Logo生成尝试 {attempt + 1}/{max_retries}")
-        
-        # 交替使用主备API以提高成功率
-        use_backup = (attempt % 2 == 1)
-        logo_image = generate_vector_image_single_attempt(prompt, background_color, use_backup=use_backup)
-        
-        if logo_image is not None:
-            # 验证logo质量
-            is_valid, validation_message = validate_logo_quality(logo_image)
-            print(f"Logo质量验证结果: {validation_message}")
-            
-            if is_valid:
-                print(f"Logo生成成功，第{attempt + 1}次尝试")
-                return logo_image
-            else:
-                print(f"Logo质量不合格: {validation_message}，准备重试")
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)  # 减少等待时间到0.5秒
-        else:
-            print(f"Logo生成失败，第{attempt + 1}次尝试")
-            if attempt < max_retries - 1:
-                time.sleep(0.8)  # 减少等待时间到0.8秒
+def generate_vector_image_with_retry(prompt, max_retries=5, background_color=None):
+    """带重试机制的logo生成函数，支持主备API切换和多种策略"""
+    successful_attempts = 0
+    total_attempts = 0
     
-    print(f"Logo生成失败，已尝试{max_retries}次")
+    # 增加重试次数到5次，并使用更智能的策略分配
+    api_strategies = [
+        (False, "主API-策略1"),  # 主API，第1次尝试
+        (False, "主API-策略2"),  # 主API，第2次尝试
+        (True, "备用API-策略1"),  # 备用API，第1次尝试
+        (False, "主API-策略3"),  # 主API，第3次尝试
+        (True, "备用API-策略2"),  # 备用API，第2次尝试
+    ]
+    
+    for attempt in range(min(max_retries, len(api_strategies))):
+        use_backup, strategy_name = api_strategies[attempt]
+        total_attempts += 1
+        
+        print(f"Logo生成尝试 {attempt + 1}/{max_retries} ({strategy_name})")
+        
+        try:
+            # 调用生成函数
+            logo_image = generate_vector_image_single_attempt(prompt, background_color, use_backup=use_backup)
+            
+            if logo_image is not None:
+                # 验证logo质量
+                is_valid, validation_message = validate_logo_quality(logo_image)
+                print(f"Logo质量验证结果: {validation_message}")
+                
+                if is_valid:
+                    successful_attempts += 1
+                    print(f"Logo生成成功！第{attempt + 1}次尝试 ({strategy_name})")
+                    print(f"成功率: {successful_attempts}/{total_attempts} = {successful_attempts/total_attempts*100:.1f}%")
+                    return logo_image
+                else:
+                    print(f"Logo质量不合格: {validation_message}，准备重试")
+            else:
+                print(f"Logo生成失败，第{attempt + 1}次尝试 ({strategy_name})")
+            
+            # 如果不是最后一次尝试，等待后重试
+            if attempt < max_retries - 1:
+                wait_time = min(2 + attempt * 0.5, 5)  # 递增等待时间，最多5秒
+                print(f"等待 {wait_time:.1f} 秒后重试...")
+                time.sleep(wait_time)
+                
+        except Exception as e:
+            print(f"Logo生成异常，第{attempt + 1}次尝试 ({strategy_name}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # 异常情况等待2秒
+    
+    print(f"Logo生成最终失败，已尝试{total_attempts}次，成功率: 0/{total_attempts} = 0%")
     return None
 
 def generate_vector_image_single_attempt(prompt, background_color=None, use_backup=False):
     """单次logo生成尝试"""
-    # 构建矢量图logo专用的提示词
-    vector_style_prompt = f"""创建一个矢量风格的logo设计: {prompt}
-    要求:
-    1. 简洁的矢量图风格，线条清晰
-    2. 必须是透明背景，不能有任何白色或彩色背景
-    3. 专业的logo设计，适合印刷到T恤上
-    4. 高对比度，颜色鲜明
-    5. 几何形状简洁，不要过于复杂
-    6. 不要包含文字或字母
-    7. 不要显示T恤或服装模型
-    8. 纯粹的图形标志设计
-    9. 矢量插画风格，扁平化设计
-    10. 重要：背景必须完全透明，不能有任何颜色填充
-    11. 请生成PNG格式的透明背景图标
-    12. 图标应该是独立的，没有任何背景元素
-    13. 确保logo有丰富的细节和多种颜色
-    14. 避免生成纯色或过于简单的图案"""
+    # 创建多个提示词变体，提高生成成功率
+    prompt_variations = [
+        f"""创建一个矢量风格的logo设计: {prompt}
+        要求:
+        1. 简洁的矢量图风格，线条清晰
+        2. 必须是透明背景，不能有任何白色或彩色背景
+        3. 专业的logo设计，适合印刷到T恤上
+        4. 高对比度，颜色鲜明
+        5. 几何形状简洁，不要过于复杂
+        6. 不要包含文字或字母
+        7. 不要显示T恤或服装模型
+        8. 纯粹的图形标志设计
+        9. 矢量插画风格，扁平化设计
+        10. 重要：背景必须完全透明，不能有任何颜色填充
+        11. 请生成PNG格式的透明背景图标
+        12. 图标应该是独立的，没有任何背景元素
+        13. 确保logo有丰富的细节和多种颜色
+        14. 避免生成纯色或过于简单的图案""",
+        
+        f"""Design a professional vector logo: {prompt}
+        Requirements:
+        - Clean vector art style with transparent background
+        - Suitable for T-shirt printing
+        - Bold colors and clear shapes
+        - No text or letters included
+        - Simple but distinctive design
+        - PNG format with transparency
+        - Rich details with multiple colors""",
+        
+        f"""制作一个简洁的图形标志: {prompt}
+        特点:
+        - 透明背景的PNG图像
+        - 适合服装印刷
+        - 颜色丰富，对比鲜明
+        - 几何图形设计
+        - 专业品质
+        - 无文字内容
+        - 矢量风格插画"""
+    ]
+    
+    # 随机选择一个提示词变体 (基于backup状态选择不同的变体)
+    import random
+    if use_backup:
+        # 备用API使用不同的提示词策略
+        vector_style_prompt = prompt_variations[1] if len(prompt_variations) > 1 else prompt_variations[0]
+    else:
+        # 主API轮换使用不同变体
+        vector_style_prompt = random.choice(prompt_variations)
     
     # 选择API key和模型
     if use_backup:
@@ -366,25 +415,13 @@ def generate_vector_image_single_attempt(prompt, background_color=None, use_back
     if DASHSCOPE_AVAILABLE:
         try:
             print(f'提示词: {vector_style_prompt}')
-            # 添加超时控制
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("API调用超时")
-            
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(API_TIMEOUT)  # 设置超时
-            
-            try:
-                rsp = ImageSynthesis.call(
-                    api_key=api_key,
-                    model=model,
-                    prompt=vector_style_prompt,
-                    n=1,
-                    size='1024*1024'
-                )
-            finally:
-                signal.alarm(0)  # 取消超时
+            rsp = ImageSynthesis.call(
+                api_key=api_key,
+                model=model,
+                prompt=vector_style_prompt,
+                n=1,
+                size='1024*1024'
+            )
             print('DashScope响应: %s' % rsp)
             
             if rsp.status_code == HTTPStatus.OK:
@@ -421,7 +458,7 @@ def generate_vector_image_single_attempt(prompt, background_color=None, use_back
 
 def generate_vector_image(prompt, background_color=None):
     """Generate a vector-style logo with transparent background using DashScope API with retry mechanism"""
-    return generate_vector_image_with_retry(prompt, max_retries=2, background_color=background_color)
+    return generate_vector_image_with_retry(prompt, max_retries=5, background_color=background_color)
 
 def change_shirt_color(image, color_hex, apply_texture=False, fabric_type=None):
     """Change T-shirt color with optional fabric texture"""
@@ -729,11 +766,27 @@ def generate_complete_design(design_prompt, variation_id=None):
             logo_image = generate_vector_image(logo_prompt)
             
             if logo_image is None:
-                print(f"Logo生成失败: {logo_description}")
-                # 如果logo生成失败，我们仍然继续生成设计，但会在返回信息中标记
-                logo_generation_attempts = 3  # 标记已尝试生成但失败
+                print(f"Logo生成失败，尝试备用方案: {logo_description}")
+                # 备用方案1: 尝试更简单的提示词
+                simple_logo_prompt = f"Simple minimalist logo: {logo_description}, clean design, transparent background"
+                logo_image = generate_vector_image(simple_logo_prompt)
+                
+                if logo_image is None:
+                    print(f"备用方案1失败，尝试备用方案2")
+                    # 备用方案2: 使用基础几何图形
+                    geometric_prompt = f"Geometric abstract logo inspired by: {logo_description}, simple shapes, transparent background"
+                    logo_image = generate_vector_image(geometric_prompt)
+                
+                if logo_image is None:
+                    print(f"所有Logo生成方案均失败: {logo_description}")
+                    # 标记已尝试生成但失败，设计将继续但不包含Logo
+                    logo_generation_attempts = 5  # 标记已尝试5次生成但失败
+                else:
+                    print(f"Logo备用方案生成成功: {logo_description}")
+                    logo_generation_attempts = 3  # 标记经过备用方案成功
             else:
-                print(f"Logo生成成功: {logo_description}")
+                print(f"Logo主要方案生成成功: {logo_description}")
+                logo_generation_attempts = 1  # 标记首次尝试成功
         
         # 最终设计 - 不添加文字
         final_design = colored_shirt
@@ -748,7 +801,8 @@ def generate_complete_design(design_prompt, variation_id=None):
             "fabric": fabric_type,
             "logo": logo_description,
             "logo_generated": logo_image is not None,
-            "logo_attempts": logo_generation_attempts if logo_generation_attempts > 0 else (1 if logo_image is not None else 0),
+            "logo_attempts": logo_generation_attempts,
+            "logo_status": "success" if logo_image is not None else ("attempted" if logo_generation_attempts > 0 else "skipped"),
             "design_index": 0 if variation_id is None else variation_id  # 使用design_index替代variation_id
         }
     
@@ -815,8 +869,8 @@ def generate_multiple_designs(design_prompt, count=1):
     
     designs = []
     
-    # 创建线程池 - 优化并发数量
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, MAX_CONCURRENT_WORKERS)) as executor:
+    # 创建线程池
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 5)) as executor:
         # 提交所有任务，传递design_prompt参数
         future_to_id = {executor.submit(generate_single_design, i, design_prompt): i for i in range(count)}
         
@@ -924,10 +978,18 @@ def show_high_recommendation_without_explanation():
                             # 显示logo生成状态
                             if 'logo_generated' in metadata:
                                 if metadata['logo_generated']:
-                                    st.markdown("<p style='text-align:center; color:green; font-size:12px;'>✓ Logo generated</p>", unsafe_allow_html=True)
+                                    attempts = metadata.get('logo_attempts', 1)
+                                    if attempts == 1:
+                                        st.markdown("<p style='text-align:center; color:green; font-size:12px;'>✓ Logo生成成功</p>", unsafe_allow_html=True)
+                                    else:
+                                        st.markdown(f"<p style='text-align:center; color:green; font-size:12px;'>✓ Logo生成成功 (重试{attempts}次)</p>", unsafe_allow_html=True)
                                 else:
                                     attempts = metadata.get('logo_attempts', 0)
-                                    st.markdown(f"<p style='text-align:center; color:orange; font-size:12px;'>⚠ Logo failed ({attempts} attempts)</p>", unsafe_allow_html=True)
+                                    logo_status = metadata.get('logo_status', 'failed')
+                                    if logo_status == 'attempted':
+                                        st.markdown(f"<p style='text-align:center; color:orange; font-size:12px;'>⚠ Logo生成失败 ({attempts}次尝试)</p>", unsafe_allow_html=True)
+                                    else:
+                                        st.markdown("<p style='text-align:center; color:gray; font-size:12px;'>- 无Logo设计</p>", unsafe_allow_html=True)
                 elif design_count <= 6:
                     # 两行显示
                     row1_cols = st.columns(min(3, design_count))
@@ -944,10 +1006,18 @@ def show_high_recommendation_without_explanation():
                             # 显示logo生成状态
                             if 'logo_generated' in metadata:
                                 if metadata['logo_generated']:
-                                    st.markdown("<p style='text-align:center; color:green; font-size:12px;'>✓ Logo generated</p>", unsafe_allow_html=True)
+                                    attempts = metadata.get('logo_attempts', 1)
+                                    if attempts == 1:
+                                        st.markdown("<p style='text-align:center; color:green; font-size:12px;'>✓ Logo生成成功</p>", unsafe_allow_html=True)
+                                    else:
+                                        st.markdown(f"<p style='text-align:center; color:green; font-size:12px;'>✓ Logo生成成功 (重试{attempts}次)</p>", unsafe_allow_html=True)
                                 else:
                                     attempts = metadata.get('logo_attempts', 0)
-                                    st.markdown(f"<p style='text-align:center; color:orange; font-size:12px;'>⚠ Logo failed ({attempts} attempts)</p>", unsafe_allow_html=True)
+                                    logo_status = metadata.get('logo_status', 'failed')
+                                    if logo_status == 'attempted':
+                                        st.markdown(f"<p style='text-align:center; color:orange; font-size:12px;'>⚠ Logo生成失败 ({attempts}次尝试)</p>", unsafe_allow_html=True)
+                                    else:
+                                        st.markdown("<p style='text-align:center; color:gray; font-size:12px;'>- 无Logo设计</p>", unsafe_allow_html=True)
                     
                     # 显示第二行
                     if design_count > 3:
@@ -1141,7 +1211,7 @@ def show_high_recommendation_without_explanation():
                     
                     # 创建进度条和状态消息在输入框下方
                     progress_bar = progress_area.progress(0)
-                    message_area.info(f"AI正在并发生成{design_count}个独特设计，预计需要1-3分钟。请不要刷新页面或关闭浏览器。感谢您的耐心等待！♪(･ω･)ﾉ")
+                    message_area.info(f"AI is generating {design_count} unique designs for you. This may take several minutes. Please do not refresh the page or close the browser. Thank you for your patience! ♪(･ω･)ﾉ")
                     # 记录开始时间
                     start_time = time.time()
                     
@@ -1173,14 +1243,10 @@ def show_high_recommendation_without_explanation():
                             completed_count += 1
                             progress = int(100 * completed_count / design_count)
                             progress_bar.progress(progress)
-                            elapsed_time = time.time() - start_time
-                            if completed_count > 0:
-                                estimated_total_time = elapsed_time * design_count / completed_count
-                                remaining_time = max(0, estimated_total_time - elapsed_time)
-                                message_area.info(f"已完成 {completed_count}/{design_count} 个设计，预计剩余 {remaining_time:.0f} 秒...")
+                            message_area.info(f"Generated {completed_count}/{design_count} designs...")
                         
-                        # 使用线程池并行生成多个设计 - 优化并发数量
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(design_count, MAX_CONCURRENT_WORKERS)) as executor:
+                        # 使用线程池并行生成多个设计
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=design_count) as executor:
                             # 提交所有任务
                             future_to_id = {executor.submit(generate_single_safely, i): i for i in range(design_count)}
                             
