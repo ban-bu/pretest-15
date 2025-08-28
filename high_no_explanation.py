@@ -171,6 +171,10 @@ def convert_svg_to_png(svg_content):
 # 设置默认生成的设计数量，取代UI上的选择按钮
 DEFAULT_DESIGN_COUNT = 15  # 生成15个设计选项
 
+# 并发优化配置
+MAX_CONCURRENT_WORKERS = 8  # 最大并发工作线程数
+API_TIMEOUT = 30  # API调用超时时间（秒）
+
 def get_ai_design_suggestions(user_preferences=None):
     """Get design suggestions from GPT-4o-mini with more personalized features"""
     client = OpenAI(api_key=get_next_gpt4o_api_key(), base_url=GPT4O_MINI_BASE_URL)
@@ -203,13 +207,14 @@ def get_ai_design_suggestions(user_preferences=None):
     """
     
     try:
-        # 调用GPT-4o-mini
+        # 调用GPT-4o-mini，添加超时控制
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a professional design consultant. Provide design suggestions in JSON format exactly as requested."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            timeout=API_TIMEOUT  # 添加超时
         )
         
         # 返回建议内容
@@ -297,14 +302,15 @@ def validate_logo_quality(image):
     except Exception as e:
         return False, f"Logo质量验证出错: {str(e)}"
 
-def generate_vector_image_with_retry(prompt, max_retries=3, background_color=None):
-    """带重试机制的logo生成函数，支持主备API切换"""
-    # 先尝试主API（前2次尝试）
-    for attempt in range(min(2, max_retries)):
-        print(f"Logo生成尝试 {attempt + 1}/{max_retries} (使用主API)")
+def generate_vector_image_with_retry(prompt, max_retries=2, background_color=None):
+    """带重试机制的logo生成函数，支持主备API切换 - 优化版本"""
+    # 减少重试次数和等待时间以提高并发性能
+    for attempt in range(max_retries):
+        print(f"Logo生成尝试 {attempt + 1}/{max_retries}")
         
-        # 调用主API生成函数
-        logo_image = generate_vector_image_single_attempt(prompt, background_color, use_backup=False)
+        # 交替使用主备API以提高成功率
+        use_backup = (attempt % 2 == 1)
+        logo_image = generate_vector_image_single_attempt(prompt, background_color, use_backup=use_backup)
         
         if logo_image is not None:
             # 验证logo质量
@@ -312,45 +318,18 @@ def generate_vector_image_with_retry(prompt, max_retries=3, background_color=Non
             print(f"Logo质量验证结果: {validation_message}")
             
             if is_valid:
-                print(f"Logo生成成功，第{attempt + 1}次尝试 (主API)")
+                print(f"Logo生成成功，第{attempt + 1}次尝试")
                 return logo_image
             else:
                 print(f"Logo质量不合格: {validation_message}，准备重试")
                 if attempt < max_retries - 1:
-                    time.sleep(1)  # 等待1秒后重试
+                    time.sleep(0.5)  # 减少等待时间到0.5秒
         else:
-            print(f"Logo生成失败，第{attempt + 1}次尝试 (主API)")
+            print(f"Logo生成失败，第{attempt + 1}次尝试")
             if attempt < max_retries - 1:
-                time.sleep(2)  # 等待2秒后重试
+                time.sleep(0.8)  # 减少等待时间到0.8秒
     
-    # 如果主API失败，尝试备用API（剩余的尝试次数）
-    remaining_attempts = max_retries - 2
-    if remaining_attempts > 0:
-        print("主API尝试失败，切换到备用API")
-        for attempt in range(remaining_attempts):
-            print(f"Logo生成尝试 {attempt + 3}/{max_retries} (使用备用API)")
-            
-            # 调用备用API生成函数
-            logo_image = generate_vector_image_single_attempt(prompt, background_color, use_backup=True)
-            
-            if logo_image is not None:
-                # 验证logo质量
-                is_valid, validation_message = validate_logo_quality(logo_image)
-                print(f"Logo质量验证结果: {validation_message}")
-                
-                if is_valid:
-                    print(f"Logo生成成功，第{attempt + 3}次尝试 (备用API)")
-                    return logo_image
-                else:
-                    print(f"Logo质量不合格: {validation_message}，准备重试")
-                    if attempt < remaining_attempts - 1:
-                        time.sleep(1)  # 等待1秒后重试
-            else:
-                print(f"Logo生成失败，第{attempt + 3}次尝试 (备用API)")
-                if attempt < remaining_attempts - 1:
-                    time.sleep(2)  # 等待2秒后重试
-    
-    print(f"Logo生成失败，已尝试{max_retries}次（主API: 2次，备用API: {remaining_attempts}次）")
+    print(f"Logo生成失败，已尝试{max_retries}次")
     return None
 
 def generate_vector_image_single_attempt(prompt, background_color=None, use_backup=False):
@@ -387,13 +366,25 @@ def generate_vector_image_single_attempt(prompt, background_color=None, use_back
     if DASHSCOPE_AVAILABLE:
         try:
             print(f'提示词: {vector_style_prompt}')
-            rsp = ImageSynthesis.call(
-                api_key=api_key,
-                model=model,
-                prompt=vector_style_prompt,
-                n=1,
-                size='1024*1024'
-            )
+            # 添加超时控制
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("API调用超时")
+            
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(API_TIMEOUT)  # 设置超时
+            
+            try:
+                rsp = ImageSynthesis.call(
+                    api_key=api_key,
+                    model=model,
+                    prompt=vector_style_prompt,
+                    n=1,
+                    size='1024*1024'
+                )
+            finally:
+                signal.alarm(0)  # 取消超时
             print('DashScope响应: %s' % rsp)
             
             if rsp.status_code == HTTPStatus.OK:
@@ -430,7 +421,7 @@ def generate_vector_image_single_attempt(prompt, background_color=None, use_back
 
 def generate_vector_image(prompt, background_color=None):
     """Generate a vector-style logo with transparent background using DashScope API with retry mechanism"""
-    return generate_vector_image_with_retry(prompt, max_retries=3, background_color=background_color)
+    return generate_vector_image_with_retry(prompt, max_retries=2, background_color=background_color)
 
 def change_shirt_color(image, color_hex, apply_texture=False, fabric_type=None):
     """Change T-shirt color with optional fabric texture"""
@@ -824,8 +815,8 @@ def generate_multiple_designs(design_prompt, count=1):
     
     designs = []
     
-    # 创建线程池
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 5)) as executor:
+    # 创建线程池 - 优化并发数量
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, MAX_CONCURRENT_WORKERS)) as executor:
         # 提交所有任务，传递design_prompt参数
         future_to_id = {executor.submit(generate_single_design, i, design_prompt): i for i in range(count)}
         
@@ -1150,7 +1141,7 @@ def show_high_recommendation_without_explanation():
                     
                     # 创建进度条和状态消息在输入框下方
                     progress_bar = progress_area.progress(0)
-                    message_area.info(f"AI is generating {design_count} unique designs for you. This may take several minutes. Please do not refresh the page or close the browser. Thank you for your patience! ♪(･ω･)ﾉ")
+                    message_area.info(f"AI正在并发生成{design_count}个独特设计，预计需要1-3分钟。请不要刷新页面或关闭浏览器。感谢您的耐心等待！♪(･ω･)ﾉ")
                     # 记录开始时间
                     start_time = time.time()
                     
@@ -1182,10 +1173,14 @@ def show_high_recommendation_without_explanation():
                             completed_count += 1
                             progress = int(100 * completed_count / design_count)
                             progress_bar.progress(progress)
-                            message_area.info(f"Generated {completed_count}/{design_count} designs...")
+                            elapsed_time = time.time() - start_time
+                            if completed_count > 0:
+                                estimated_total_time = elapsed_time * design_count / completed_count
+                                remaining_time = max(0, estimated_total_time - elapsed_time)
+                                message_area.info(f"已完成 {completed_count}/{design_count} 个设计，预计剩余 {remaining_time:.0f} 秒...")
                         
-                        # 使用线程池并行生成多个设计
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=design_count) as executor:
+                        # 使用线程池并行生成多个设计 - 优化并发数量
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(design_count, MAX_CONCURRENT_WORKERS)) as executor:
                             # 提交所有任务
                             future_to_id = {executor.submit(generate_single_safely, i): i for i in range(design_count)}
                             
