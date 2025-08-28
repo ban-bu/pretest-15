@@ -1113,7 +1113,7 @@ def show_high_recommendation_without_explanation():
         # 生成设计按钮
         generate_col = st.empty()
         with generate_col:
-            generate_button = st.button("🎨 Generate T-shirt Designs", key="generate_design", use_column_width=True)
+            generate_button = st.button("🎨 Generate T-shirt Designs", key="generate_design", use_container_width=True)
         
         # 创建进度和消息区域在输入框下方
         progress_area = st.empty()
